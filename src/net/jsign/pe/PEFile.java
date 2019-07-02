@@ -19,29 +19,28 @@ package net.jsign.pe;
 import net.jsign.DigestAlgorithm;
 import net.jsign.asn1.authenticode.AuthenticodeObjectIdentifiers;
 import org.bouncycastle.asn1.*;
-import org.bouncycastle.asn1.cms.Attribute;
-import org.bouncycastle.asn1.cms.AttributeTable;
-import org.bouncycastle.asn1.cms.ContentInfo;
-import org.bouncycastle.asn1.cms.SignedData;
+import org.bouncycastle.asn1.cms.*;
 import org.bouncycastle.asn1.pkcs.PKCSObjectIdentifiers;
 import org.bouncycastle.asn1.x509.AlgorithmIdentifier;
 import org.bouncycastle.asn1.x509.DigestInfo;
 import org.bouncycastle.asn1.x509.X509ObjectIdentifiers;
 import org.bouncycastle.cert.X509CertificateHolder;
+import org.bouncycastle.cert.jcajce.JcaX509CertificateConverter;
 import org.bouncycastle.cms.CMSProcessable;
 import org.bouncycastle.cms.CMSSignedData;
 import org.bouncycastle.cms.SignerInformation;
 import org.bouncycastle.operator.DefaultAlgorithmNameFinder;
 import org.bouncycastle.operator.DefaultDigestAlgorithmIdentifierFinder;
 
-import javax.naming.AuthenticationException;
 import java.io.*;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.channels.SeekableByteChannel;
 import java.nio.file.Files;
 import java.nio.file.StandardOpenOption;
-import java.security.MessageDigest;
+import java.security.*;
+import java.security.cert.CertificateException;
+import java.security.cert.X509Certificate;
 import java.util.*;
 
 /**
@@ -828,12 +827,13 @@ public class PEFile implements Closeable {
         channel.write(ByteBuffer.allocate((int) padding));
     }
 
-    public void verify() throws IOException, AuthenticationException {
+    public void verify() throws IOException, VerificationException {
         verify(false);
     }
 
-    public void verify(boolean verbose) throws AuthenticationException, IOException {
+    public void verify(boolean verbose) throws VerificationException, IOException {
 
+        MessageDigest md;
         List<CMSSignedData> signatures = getSignatures();
 
         if(!signatures.isEmpty()) {
@@ -856,36 +856,132 @@ public class PEFile implements Closeable {
 
                 //#1 Check that the digest algorithms match
                     if(signedData.getDigestAlgorithmIDs().size() != 1) {
-                        throw new AuthenticationException("Signed Data must contain exactly one DigestAlgorithm");
+                        throw new VerificationException("Signed Data must contain exactly one DigestAlgorithm");
                     }
 
                     //Check that SpcIndirectContent DigestAlgorithm equals CMSSignedData algorithm
                     if(!(spcDigestAlgorithm.oid.getId()).equals(signedDataAlgorithm.oid.getId())) {
-                        throw new AuthenticationException("Signed Data algorithm doesn't match with spcDigestAlgorithm");
+                        throw new VerificationException("Signed Data algorithm doesn't match with spcDigestAlgorithm");
                     }
 
                     //Check that SignerInfo DigestAlgorithm equals CMSSignedData algorithm
                     if(signedData.getSignerInfos().size() != 1) {
-                        throw new AuthenticationException("Signed Data must contain exactly one SignerInfo");
+                        throw new VerificationException("Signed Data must contain exactly one SignerInfo");
                     }
 
                     signerInformation = signedData.getSignerInfos().iterator().next();
                     if(!(signerInformation.getDigestAlgorithmID().getAlgorithm().getId()).equals(signedDataAlgorithm.oid.getId())) {
-                        throw new AuthenticationException("Signed Data algorithm doesn't match with SignerInformation algorithm");
+                        throw new VerificationException("Signed Data algorithm doesn't match with SignerInformation algorithm");
                     }
 
                 //#2 Check the embedded hash in spcIndirectContent matches with the computed hash of the pefile
-                if(!Arrays.equals(computeDigest(signedDataAlgorithm), digestInfo.getDigest()))
-                    throw new AuthenticationException("The embedded hash in the SignedData is not equal to the computed hash");
+                    if(!Arrays.equals(computeDigest(signedDataAlgorithm), digestInfo.getDigest()))
+                        throw new VerificationException("The embedded hash in the SignedData is not equal to the computed hash");
 
+                //#3 The hash of the spc blob should be equal to message digest in authenticated attributes of signed data
+                    //Get the message digest from authenticated attributes, see authenticode_pe documentation
+                    byte messageDigestInAuthenticatedAttr[];
+                    Attribute attribute = (Attribute)signerInformation.getSignedAttributes().toHashtable().get(CMSAttributes.messageDigest);
+                    Object digestObj = attribute.getAttrValues().iterator().next();
 
+                    if(digestObj instanceof ASN1OctetString) {
+
+                        ASN1OctetString oct = (ASN1OctetString)digestObj;
+
+                        messageDigestInAuthenticatedAttr = oct.getOctets();
+                    }
+                    else {
+                        throw new VerificationException("No message digest was found in authenticated attributes");
+                    }
+
+                    //Get the spc blob
+                    byte[] spcBlob = getSpcBlob(contentInfo1.getContent().toASN1Primitive());
+
+                    //Now calculate the digest of the spcblob
+                    try {
+                        md = MessageDigest.getInstance(signedData.getDigestAlgorithmIDs().iterator().next().getAlgorithm().toString());
+                    } catch (NoSuchAlgorithmException e) {
+                        throw new VerificationException(e.getMessage());
+                    }
+
+                    md.update(spcBlob);
+                        byte[] spcDigest = md.digest();
+
+                        //Compare both and throw exception if not equal
+                        if(!Arrays.equals(messageDigestInAuthenticatedAttr, spcDigest))
+                            throw new VerificationException("The hash of stripped content of SpcInfo does not match digest found in authenticated attributes");
+
+                //#4 Check the hash in Authenticated Attributes with Encrypted Hash
+                    X509CertificateHolder h = (X509CertificateHolder) signedData.getCertificates().getMatches(signerInformation.getSID()).iterator().next();
+                    JcaX509CertificateConverter converter = new JcaX509CertificateConverter();
+                    X509Certificate certificate = null;
+                    try {
+                        certificate = converter.getCertificate(h);
+                    } catch (CertificateException e) {
+                        throw new VerificationException(e.getMessage());
+                    }
+                    PublicKey key = certificate.getPublicKey();
+                    Signature signature = null;
+                    try {
+                        signature = Signature.getInstance(certificate.getSigAlgName());
+                    } catch (NoSuchAlgorithmException e) {
+                        throw new VerificationException(e.getMessage());
+                    }
+                    try {
+                        signature.initVerify(key);
+                    } catch (InvalidKeyException e) {
+                        throw new VerificationException(e.getMessage());
+                    }
+
+                    try {
+                        signature.update(signerInformation.getEncodedSignedAttributes());
+                        if(!signature.verify(signerInformation.getSignature())) {
+                            throw new VerificationException("The hash in the the authenticated attributes doesn't match the encrypted hash(getSignature())");
+                        }
+                        //Note that the getSignature() method returns the encrypted hash in the SignerInformation
+                    } catch (SignatureException e) {
+                        throw new VerificationException(e.getMessage());
+                    }
+
+                //#4 Check the countersigner hash
+                    if(signerInformation.getCounterSignatures().size() != 0) {
+
+                        SignerInformation counterSignerInformation = signerInformation.getCounterSignatures().iterator().next();
+                        try {
+                            md = MessageDigest.getInstance(counterSignerInformation.getDigestAlgorithmID().getAlgorithm().toString());
+                        } catch (NoSuchAlgorithmException e) {
+                            throw new VerificationException(e.getMessage());
+                        }
+                        md.update(signerInformation.getSignature());
+                        byte[] authAttrHash = md.digest();
+
+                        byte[] messageDigestInCounterSignature;
+                        Attribute attributeOfCounterSignature = (Attribute)counterSignerInformation.getSignedAttributes().toHashtable().get(CMSAttributes.messageDigest);
+                        Object digestObjOfCounterSignature = attributeOfCounterSignature.getAttrValues().iterator().next();
+
+                        if(digestObjOfCounterSignature instanceof ASN1OctetString) {
+
+                            ASN1OctetString oct = (ASN1OctetString)digestObjOfCounterSignature;
+
+                            messageDigestInCounterSignature = oct.getOctets();
+                        }
+                        else {
+                            throw new VerificationException("No message digest was found in authenticated attributes of counter signature");
+                        }
+
+                        //Compare both and throw exception if not equal
+                        if(!Arrays.equals(messageDigestInCounterSignature, authAttrHash))
+                            throw new VerificationException("The digest of encrypted hash in the signerInformation does not match with digest found in counter signature");
+
+                    }
             }
         }
         else {
 
-            throw new AuthenticationException("No Signatures Present");
+            throw new VerificationException("No Signatures Present");
         }
     }
+
 
     private DigestInfo getSpcIndirectDataContent(ContentInfo contentInfo) {
 
@@ -921,7 +1017,6 @@ public class PEFile implements Closeable {
 
                         if(digestAlgorithmObj instanceof ASN1ObjectIdentifier) {
 
-                            System.out.println(((ASN1ObjectIdentifier) digestAlgorithmObj).getId());
                             AlgorithmIdentifier a = new DefaultDigestAlgorithmIdentifierFinder().find(new DefaultAlgorithmNameFinder().getAlgorithmName((ASN1ObjectIdentifier) digestAlgorithmObj));
                             algId = AlgorithmIdentifier.getInstance(a);
                         }
@@ -940,5 +1035,33 @@ public class PEFile implements Closeable {
         digestInfo = new DigestInfo(algId, digest);
 
         return digestInfo;
+    }
+
+    private byte[] getSpcBlob(ASN1Primitive primitive) throws IOException {
+
+        ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
+
+            if(primitive instanceof ASN1Sequence) {
+
+                Iterator it = ((ASN1Sequence) primitive).iterator();
+
+                while(it.hasNext()) {
+                    ASN1Primitive p = (ASN1Primitive)it.next();
+                    outputStream.write(p.getEncoded());
+                }
+
+                return outputStream.toByteArray();
+            }
+
+        return null;
+    }
+
+    private void printDigest(byte[] digest) {
+
+        for (byte b : digest) {
+            String st = String.format("%02X", b);
+            System.out.print(st);
+        }
+        System.out.println();
     }
 }

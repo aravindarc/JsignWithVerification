@@ -10,15 +10,6 @@
     <orderEntry type="module-library">
       <library>
         <CLASSES>
-          <root url="jar://E:/Erstwhile F Drive/PROGRAMMING/WebApp/apache-tomcat-9.0.21/lib/mysql-connector-java-8.0.16.jar!/" />
-        </CLASSES>
-        <JAVADOC />
-        <SOURCES />
-      </library>
-    </orderEntry>
-    <orderEntry type="module-library">
-      <library>
-        <CLASSES>
           <root url="jar://$MODULE_DIR$/libs/jsign_core_jar/bcpkix-jdk15on-1.60.jar!/" />
           <root url="jar://$MODULE_DIR$/libs/jsign_core_jar/bcprov-jdk15on-1.58.jar!/" />
           <root url="file://$MODULE_DIR$" />
@@ -27,6 +18,16 @@
         <SOURCES>
           <root url="file://$MODULE_DIR$/src" />
         </SOURCES>
+      </library>
+    </orderEntry>
+    <orderEntry type="module-library">
+      <library>
+        <CLASSES>
+          <root url="file://$MODULE_DIR$/libs" />
+        </CLASSES>
+        <JAVADOC />
+        <SOURCES />
+        <jarDirectory url="file://$MODULE_DIR$/libs" recursive="false" />
       </library>
     </orderEntry>
   </component>
